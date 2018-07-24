@@ -1,9 +1,9 @@
 extern crate dotenv;
 extern crate futures;
-extern crate telegram_bot;
 extern crate tokio_core;
 
 #[macro_use] extern crate failure;
+#[macro_use] extern crate telegram_bot;
 
 mod server;
 
