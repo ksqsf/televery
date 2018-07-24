@@ -1,0 +1,11 @@
+[package]
+name = "televery"
+version = "0.1.0"
+authors = ["_rika <i@ksqsf.moe>"]
+
+[dependencies]
+dotenv = "0.13"
+failure = "0.1"
+futures = "0.1"
+telegram-bot = "0.6"
+tokio-core = "0.1"

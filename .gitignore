@@ -1,2 +1,4 @@
 .env
 chat_id
+target/
+Cargo.lock
