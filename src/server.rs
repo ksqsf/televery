@@ -83,12 +83,41 @@ impl Server {
         let trusted_users = &self.trusted_users;
         let state = self.state;
 
+        // channel between sock and bot sides
+        let (_sock_tx, bot_rx) = mpsc::unbounded();
+
         // bot side: communicate with telegram api and socket
         let bot_updates = api.stream().for_each(|update| {
             process_telegram_update(handle, api, update, trusted_users, state.clone());
             Ok(())
         }).map_err(|e| println!("bot updates error: {:?}", e));
-        let bot = bot_updates;
+        let bot_server = bot_rx.for_each(|message: ServerMessage| {
+            match message {
+                ServerMessage::SendMessage(ref username) => {
+                    let user_chatid = state.user_chatid.borrow();
+                    if !user_chatid.contains_key(username) {
+                        println!("{} is asked to give permission, but chat id is missing", username);
+                    }
+
+                    let chatid = user_chatid.get(username).unwrap();
+                    let inline_keyboard = reply_markup!(
+                        inline_keyboard,
+                        ["Pass" callback "0,0", "Deny" callback "0,1"]
+                    );
+                    let mut msg = requests::SendMessage::new(chatid, "OK?");
+                    let fut = api.send(msg.reply_markup(inline_keyboard))
+                        .and_then(|msg| {
+                            println!("confirm message id = {}", msg.id);
+                            Ok(())
+                        })
+                        .map_err(|e| println!("error sending message: {:?}", e));
+                    handle.spawn(fut);
+                }
+                _ => unreachable!()
+            }
+            Ok(())
+        });
+        let bot = bot_updates.select(bot_server).map(unit).map_err(unit);
 
         // socket side:
         // impl Stream<Item = (), Error = ()>
@@ -96,7 +125,7 @@ impl Server {
             println!("New connection: {}", addr);
             let (reader, writer) = stream.split();
             let (chan_tx, chan_rx) = mpsc::unbounded();
-        
+
             let socket_reader = process_verification_request(reader, chan_tx);
             let socket_writer = chan_rx.fold(writer, |writer, msg: &str| {
                 io::write_all(writer, msg.as_bytes())
