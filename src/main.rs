@@ -1,6 +1,5 @@
 extern crate bytes;
 extern crate clap;
-extern crate dotenv;
 extern crate failure;
 extern crate serde_yaml;
 extern crate tokio_core;
@@ -19,13 +18,10 @@ use clap::{App, Arg};
 use failure::Error;
 use server::Server;
 use std::collections::BTreeSet;
-use std::env;
 use std::fs::File;
 use std::path::Path;
 
 fn main() -> Result<(), Error> {
-    dotenv::dotenv().ok();
-
     let matches = App::new("Televery")
         .about("Hassle-free two-step verification")
         .arg(
@@ -46,16 +42,16 @@ fn main() -> Result<(), Error> {
     Config::from_file(matches.value_of("config").unwrap()).and_then(|cfg| start_server(cfg))
 }
 
-fn start_server(config: Config) -> Result<(), Error> {
-    let trusted_apps = config.trusted_apps;
-    let trusted_users = config.trusted_users;
-    let mut srv = Server::new(trusted_apps, trusted_users)?;
-    srv.bind(env::var("TELEVERY_BOT_TOKEN")?, "127.0.0.1:12345".parse()?)?;
+fn start_server(cfg: Config) -> Result<(), Error> {
+    let mut srv = Server::new(cfg.trusted_apps, cfg.trusted_users)?;
+    srv.bind(cfg.bot_token, cfg.listen_address.parse()?)?;
     srv.run()
 }
 
 #[derive(Deserialize)]
 struct Config {
+    listen_address: String,
+    bot_token: String,
     trusted_users: BTreeSet<String>,
     trusted_apps: BTreeSet<String>,
 }

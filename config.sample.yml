@@ -1,3 +1,11 @@
+# Local listening address.
+#
+# Format: <IPv4/IPv6 address>:<port>
+listen_address: 127.0.0.1:12345
+
+# Your Telegram bot token.
+bot_token: 110201543:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw
+
 # Trusted users will all be asked on Telegram, and they all can
 # process a request.
 #
