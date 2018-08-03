@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Error as io_Error, ErrorKind as io_ErrorKind};
 use std::net::SocketAddr;
 use std::rc::Rc;
+use std::str;
 use telegram_bot::*;
 use tokio_core::net::{TcpListener, TcpStream};
 use tokio_core::reactor::Core;
@@ -358,8 +359,7 @@ impl Stream for Frames {
             let mut line = self.rd.split_to(pos + 1);
             line.split_off(pos);
 
-            // convert to &str and parse it
-            let line = ::std::str::from_utf8(line.as_ref());
+            let line = str::from_utf8(line.as_ref());
             match line {
                 Err(_) => {
                     // if request is invalid, close the connection
@@ -369,28 +369,7 @@ impl Stream for Frames {
                     ));
                 }
                 Ok(line) => {
-                    println!("Received line: {}", line);
-                    let mut parts = line.split(' ');
-                    // check length
-                    // fixme: magic number
-                    if parts.clone().count() != 2 {
-                        return Err(io_Error::new(
-                            io_ErrorKind::InvalidInput,
-                            "invalid length of request",
-                        ));
-                    }
-                    // check method
-                    let (method, appname) = (parts.next(), parts.next());
-                    println!("Parsed: {:?} {:?}", method, appname);
-                    match (method, appname) {
-                        (None, _) | (_, None) => return Ok(Async::NotReady),
-                        (Some(method), Some(appname)) => {
-                            return Ok(Async::Ready(Some(VerifyRequest {
-                                method: method.to_string(),
-                                appname: appname.to_string(),
-                            })))
-                        }
-                    }
+                    return Ok(Async::Ready(Some(line.parse()?)));
                 }
             }
         }
@@ -400,6 +379,27 @@ impl Stream for Frames {
         } else {
             Ok(Async::NotReady)
         }
+    }
+}
+
+impl str::FromStr for VerifyRequest {
+    type Err = io_Error;
+
+    fn from_str(s: &str) -> Result<VerifyRequest, io_Error> {
+        let parts: Vec<&str> = s.split(' ').collect();
+        // fixme: magic number
+        if parts.len() != 2 {
+            return Err(io_Error::new(
+                io_ErrorKind::InvalidInput,
+                "invalid length of request",
+            ));
+        }
+
+        let (method, appname) = (parts[0], parts[1]);
+        Ok(VerifyRequest {
+            method: method.to_string(),
+            appname: appname.to_string(),
+        })
     }
 }
 
