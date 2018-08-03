@@ -9,7 +9,7 @@ use std::net::SocketAddr;
 use std::rc::Rc;
 use telegram_bot::*;
 use tokio_core::net::{TcpListener, TcpStream};
-use tokio_core::reactor::{Core, Handle};
+use tokio_core::reactor::Core;
 use tokio_io::io::{self, ReadHalf};
 use tokio_io::AsyncRead;
 
@@ -25,10 +25,11 @@ pub struct Server {
     listener: Option<TcpListener>,
 
     /// Trusted apps.
-    trusted_apps: BTreeSet<String>,
+    #[allow(dead_code)]
+    trusted_apps: Rc<BTreeSet<String>>,
 
     /// Trusted Telegram usernames.
-    trusted_users: BTreeSet<String>,
+    trusted_users: Rc<BTreeSet<String>>,
 
     /// Server state.
     state: Rc<State>,
@@ -38,6 +39,9 @@ pub struct Server {
 struct State {
     /// Mapping from usernames to chat ID.
     user_chatid: RefCell<BTreeMap<String, ChatId>>,
+
+    /// Mapping from message ID to socket writer.
+    msgid_chan: RefCell<BTreeMap<MessageId, mpsc::UnboundedSender<&'static str>>>,
 }
 
 impl Server {
@@ -51,10 +55,11 @@ impl Server {
             core,
             api: None,
             listener: None,
-            trusted_apps,
-            trusted_users,
+            trusted_apps: Rc::new(trusted_apps),
+            trusted_users: Rc::new(trusted_users),
             state: Rc::new(State {
                 user_chatid: RefCell::new(BTreeMap::new()),
+                msgid_chan: RefCell::new(BTreeMap::new()),
             }),
         })
     }
@@ -63,9 +68,11 @@ impl Server {
     /// configure Telegram bot API.
     pub fn bind(&mut self, token: impl AsRef<str>, addr: SocketAddr) -> Result<(), Error> {
         let core = &self.core;
-        let api = Some(Api::configure(token)
-            .build(core.handle())
-            .map_err(SyncFailure::new)?);
+        let api = Some(
+            Api::configure(token)
+                .build(core.handle())
+                .map_err(SyncFailure::new)?,
+        );
         let listener = Some(TcpListener::bind(&addr, &core.handle())?);
 
         self.api = api;
@@ -80,45 +87,71 @@ impl Server {
     pub fn run(mut self) -> ! {
         let handle = &self.core.handle();
         let api = &self.api.unwrap();
-        let trusted_users = &self.trusted_users;
+        let trusted_users = self.trusted_users;
+        let trusted_apps = self.trusted_apps;
         let state = self.state;
 
         // channel between sock and bot sides
-        let (_sock_tx, bot_rx) = mpsc::unbounded();
+        let (sock_tx, bot_rx) = mpsc::unbounded();
 
         // bot side: communicate with telegram api and socket
-        let bot_updates = api.stream()
+        let bot_updates = api
+            .stream()
             .for_each(|update| {
-                process_telegram_update(handle, api, update, trusted_users, state.clone());
+                process_telegram_update(api, update, trusted_users.clone(), state.clone());
                 Ok(())
             })
             .map_err(|e| println!("bot updates error: {:?}", e));
+
         let bot_server = bot_rx.for_each(|message: ServerMessage| {
             match message {
-                ServerMessage::SendMessage(ref username) => {
+                ServerMessage::SendMessage(writer, appname) => {
                     let user_chatid = state.user_chatid.borrow();
-                    if !user_chatid.contains_key(username) {
-                        println!(
-                            "{} is asked to give permission, but chat id is missing",
-                            username
-                        );
+                    let trusted_users = trusted_users.clone();
+
+                    if !trusted_apps.contains(&appname) {
+                        println!("{} is denied because it's not trusted", appname);
+                        writer.unbounded_send(VerifyResult::Deny.into()).unwrap();
+                        return Ok(());
                     }
 
-                    let chatid = user_chatid.get(username).unwrap();
-                    let inline_keyboard = reply_markup!(
-                        inline_keyboard,
-                        ["Pass" callback "0,0", "Deny" callback "0,1"]
-                    );
-                    let mut msg = requests::SendMessage::new(chatid, "OK?");
-                    let fut = api.send(msg.reply_markup(inline_keyboard))
-                        .and_then(|msg| {
-                            println!("confirm message id = {}", msg.id);
-                            Ok(())
-                        })
-                        .map_err(|e| println!("error sending message: {:?}", e));
-                    handle.spawn(fut);
+                    // Send confirm messages to every trusted user
+                    for user in trusted_users.iter() {
+                        let user = user.clone();
+                        let state = state.clone();
+                        let writer = writer.clone();
+                        let chatid = user_chatid.get(&user);
+                        if chatid.is_none() {
+                            println!("don't know chat id of user {}, ignoring", user);
+                            continue;
+                        }
+                        let chatid = chatid.unwrap();
+
+                        let inline_keyboard = reply_markup!(
+                            inline_keyboard,
+                            ["Pass" callback "0,0", "Deny" callback "0,1"]
+                        );
+
+                        let mut msg = format!(
+                            "Hi, @{}! {} is asking for verification. Shall it pass?",
+                            user, appname
+                        );
+                        let fut =
+                            api.send(
+                                requests::SendMessage::new(chatid, msg)
+                                    .reply_markup(inline_keyboard),
+                            ).and_then(move |msg| {
+                                    println!("confirm message id = {}", msg.id);
+                                    // Save message id and channel writer for future use.
+                                    state.msgid_chan.borrow_mut().insert(msg.id, writer);
+                                    Ok(())
+                                })
+                                .map_err(move |e| {
+                                    println!("error sending message to {}: {:?}", user, e)
+                                });
+                        handle.spawn(fut);
+                    }
                 }
-                _ => unreachable!(),
             }
             Ok(())
         });
@@ -126,7 +159,8 @@ impl Server {
 
         // socket side:
         // impl Stream<Item = (), Error = ()>
-        let req = self.listener
+        let req = self
+            .listener
             .unwrap()
             .incoming()
             .for_each(|(stream, addr)| {
@@ -134,7 +168,7 @@ impl Server {
                 let (reader, writer) = stream.split();
                 let (chan_tx, chan_rx) = mpsc::unbounded();
 
-                let socket_reader = process_verification_request(reader, chan_tx);
+                let socket_reader = process_verification_request(reader, chan_tx, sock_tx.clone());
                 let socket_writer = chan_rx
                     .fold(writer, |writer, msg: &str| {
                         io::write_all(writer, msg.as_bytes())
@@ -155,14 +189,13 @@ impl Server {
 
 /// Process Telegram updates.
 fn process_telegram_update(
-    handle: &Handle,
     api: &Api,
     update: Update,
-    trusted_users: &BTreeSet<String>,
+    trusted_users: Rc<BTreeSet<String>>,
     state: Rc<State>,
 ) {
     match update.kind {
-        UpdateKind::CallbackQuery(query) => process_telegram_callback(handle, query),
+        UpdateKind::CallbackQuery(query) => process_telegram_callback(api, query, state.clone()),
         UpdateKind::Message(message) => {
             process_telegram_message(api, &message, trusted_users, state.clone());
         }
@@ -173,7 +206,7 @@ fn process_telegram_update(
 fn process_telegram_message(
     api: &Api,
     message: &Message,
-    trusted_users: &BTreeSet<String>,
+    trusted_users: Rc<BTreeSet<String>>,
     state: Rc<State>,
 ) {
     use self::MessageKind::*;
@@ -206,13 +239,31 @@ fn process_telegram_message(
     }
 }
 
-fn process_telegram_callback(_handle: &Handle, query: CallbackQuery) {
-    println!("process_telegram_callback: {:#?}", query);
-    if query.data == "0,1" {
-        println!("admin denied")
+fn process_telegram_callback(api: &Api, query: CallbackQuery, state: Rc<State>) {
+    let username = query.from.username.unwrap();
+    let response = if query.data == "0,0" {
+        println!("{:?} passed id {}", username, query.message.id);
+        VerifyResult::Allow
     } else {
-        println!("admin passed")
-    }
+        println!("{:?} denied id {}", username, query.message.id);
+        VerifyResult::Deny
+    };
+
+    let tx = match state.msgid_chan.borrow().get(&query.message.id) {
+        Some(tx) => tx.clone(),
+        None => {
+            println!("invalid message id");
+            return;
+        }
+    };
+
+    tx.unbounded_send(response.into()).unwrap();
+    state.msgid_chan.borrow_mut().remove(&query.message.id);
+
+    api.spawn(query.message.edit_text(format!(
+        "@{} has answered this verification request.",
+        username
+    )))
 }
 
 /// Process verification requests. This function will consume a stream
@@ -220,15 +271,24 @@ fn process_telegram_callback(_handle: &Handle, query: CallbackQuery) {
 fn process_verification_request(
     stream: ReadHalf<TcpStream>,
     chan_tx: mpsc::UnboundedSender<&'static str>,
+    sock_tx: mpsc::UnboundedSender<ServerMessage>,
 ) -> impl Future<Item = (), Error = ()> {
     Frames::new(stream)
         .for_each(move |request| {
             println!("{} asks {}", request.appname, request.method);
-            let res = match request.method.as_str() {
-                "REQ" => VerifyResult::Allow.into(),
-                _ => VerifyResult::Deny.into(),
-            };
-            chan_tx.unbounded_send(res).expect("chan_send");
+            match request.method.as_str() {
+                "REQ" => {
+                    sock_tx
+                        .unbounded_send(ServerMessage::SendMessage(
+                            chan_tx.clone(),
+                            request.appname,
+                        ))
+                        .unwrap();
+                }
+                _ => {
+                    chan_tx.unbounded_send(VerifyResult::Deny.into()).unwrap();
+                }
+            }
             Ok(())
         })
         .map_err(|e| println!("in process verify: {:?}", e))
@@ -262,13 +322,8 @@ enum VerifyResult {
 /// socket side.
 #[derive(Debug, Clone)]
 enum ServerMessage {
-    // Send a verification message via Telegram bot to the user.  The
-    // first argument means the Telegram username.
-    SendMessage(String),
-
-    // The user has answered, and forward the result to the socket
-    // side.
-    Answer(VerifyResult),
+    // Send a verification message via Telegram bot to the user.
+    SendMessage(mpsc::UnboundedSender<&'static str>, String),
 }
 
 impl Frames {
