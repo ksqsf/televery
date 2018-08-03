@@ -1,4 +1,5 @@
 extern crate bytes;
+extern crate clap;
 extern crate dotenv;
 extern crate failure;
 extern crate serde_yaml;
@@ -14,6 +15,7 @@ extern crate telegram_bot;
 
 mod server;
 
+use clap::{App, Arg};
 use failure::Error;
 use server::Server;
 use std::collections::BTreeSet;
@@ -23,7 +25,25 @@ use std::path::Path;
 
 fn main() -> Result<(), Error> {
     dotenv::dotenv().ok();
-    Config::from_file("config.yml").and_then(|cfg| start_server(cfg))
+
+    let matches = App::new("Televery")
+        .about("Hassle-free two-step verification")
+        .arg(
+            Arg::with_name("config")
+                .short("c")
+                .long("config")
+                .value_name("FILE")
+                .help("Specify the config file")
+                .default_value("config.yml")
+                .takes_value(true),
+        )
+        .get_matches();
+
+    if matches.occurrences_of("config") == 0 {
+        eprintln!("WARNING: --config not specified, 'config.yml' is used");
+    }
+
+    Config::from_file(matches.value_of("config").unwrap()).and_then(|cfg| start_server(cfg))
 }
 
 fn start_server(config: Config) -> Result<(), Error> {

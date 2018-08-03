@@ -4,6 +4,7 @@ name = "televery"
 version = "0.1.0"
 [dependencies]
 bytes = "0.4.9"
+clap = "2.32"
 dotenv = "0.13.0"
 failure = "0.1.1"
 futures = "0.1.23"
