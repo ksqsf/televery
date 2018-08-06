@@ -98,7 +98,14 @@ impl Server {
 
         // bot side: communicate with telegram api and socket
         let bot_updates = Server::bot_updates(api, trusted_users.clone(), state.clone());
-        let bot_controller = Server::bot_controller(api, handle.clone(), bot_rx, trusted_users, trusted_apps, state);
+        let bot_controller = Server::bot_controller(
+            api,
+            handle.clone(),
+            bot_rx,
+            trusted_users,
+            trusted_apps,
+            state,
+        );
         let bot = bot_updates.select(bot_controller).map(unit).map_err(unit);
 
         // socket side:
@@ -114,27 +121,30 @@ impl Server {
     fn local_requests(
         handle: Handle,
         listener: TcpListener,
-        sock_tx: mpsc::UnboundedSender<ServerMessage>
+        sock_tx: mpsc::UnboundedSender<ServerMessage>,
     ) -> impl Future<Item = (), Error = ()> {
         let sock_tx = sock_tx.clone();
 
-        listener.incoming().for_each(move |(stream, addr)| {
-            println!("New connection: {}", addr);
-            let (reader, writer) = stream.split();
-            let (chan_tx, chan_rx) = mpsc::unbounded();
+        listener
+            .incoming()
+            .for_each(move |(stream, addr)| {
+                println!("New connection: {}", addr);
+                let (reader, writer) = stream.split();
+                let (chan_tx, chan_rx) = mpsc::unbounded();
 
-            let socket_reader = process_verification_request(reader, chan_tx, sock_tx.clone());
-            let socket_writer = chan_rx
-                .fold(writer, |writer, msg: &str| {
-                    io::write_all(writer, msg.as_bytes())
-                        .map(|(writer, _)| writer)
-                        .map_err(|e| println!("in write all: {:?}", e))
-                })
-                .map(unit);
+                let socket_reader = process_verification_request(reader, chan_tx, sock_tx.clone());
+                let socket_writer = chan_rx
+                    .fold(writer, |writer, msg: &str| {
+                        io::write_all(writer, msg.as_bytes())
+                            .map(|(writer, _)| writer)
+                            .map_err(|e| println!("in write all: {:?}", e))
+                    })
+                    .map(unit);
 
-            handle.spawn(socket_reader.select(socket_writer).map(unit).map_err(unit));
-            Ok(())
-        }).map_err(|e| println!("socket error: {:?}", e))
+                handle.spawn(socket_reader.select(socket_writer).map(unit).map_err(unit));
+                Ok(())
+            })
+            .map_err(|e| println!("socket error: {:?}", e))
     }
 
     /// This function constructs a future that deals with Telegram bot
@@ -142,14 +152,15 @@ impl Server {
     fn bot_updates<'a>(
         api: &'a Api,
         trusted_users: Rc<BTreeSet<String>>,
-        state: Rc<State>
+        state: Rc<State>,
     ) -> impl Future<Item = (), Error = ()> + 'a {
-        api.stream().for_each(move |update| {
-            process_telegram_update(api, update, trusted_users.clone(), state.clone());
-            Ok(())
-        }).map_err(|e| println!("bot updates error: {:?}", e))
+        api.stream()
+            .for_each(move |update| {
+                process_telegram_update(api, update, trusted_users.clone(), state.clone());
+                Ok(())
+            })
+            .map_err(|e| println!("bot updates error: {:?}", e))
     }
-
 
     /// This function constructs a future that listens for server's
     /// internal message, and do Telegram-bot-y things on behalf of
@@ -160,7 +171,7 @@ impl Server {
         bot_rx: mpsc::UnboundedReceiver<ServerMessage>,
         trusted_users: Rc<BTreeSet<String>>,
         trusted_apps: Rc<BTreeSet<String>>,
-        state: Rc<State>
+        state: Rc<State>,
     ) -> impl Future<Item = (), Error = ()> + 'a {
         bot_rx.for_each(move |message| {
             match message {
@@ -169,14 +180,21 @@ impl Server {
 
                     if !trusted_apps.contains(&appname) {
                         println!("{} is denied because it's not trusted", appname);
-                        sock_writer.unbounded_send(VerifyResult::Deny.into()).unwrap();
+                        sock_writer
+                            .unbounded_send(VerifyResult::Deny.into())
+                            .unwrap();
                         return Ok(());
                     }
 
                     // Send confirm messages to every trusted user
-                    for user in trusted_users.iter() {
-                        if let Some(fut) = Server::send_confirm(api, user.clone(), appname.clone(), state.clone(), sock_writer.clone())
-                        {
+                    for user in &*trusted_users {
+                        if let Some(fut) = Server::send_confirm(
+                            api,
+                            user.clone(),
+                            appname.clone(),
+                            state.clone(),
+                            sock_writer.clone(),
+                        ) {
                             handle.spawn(fut);
                         }
                     }
@@ -194,7 +212,7 @@ impl Server {
         user: String,
         appname: String,
         state: Rc<State>,
-        sock_writer: mpsc::UnboundedSender<&'static str>
+        sock_writer: mpsc::UnboundedSender<&'static str>,
     ) -> Option<impl Future<Item = (), Error = ()> + 'static> {
         let state = state.clone();
         let chatid = match state.user_chatid.borrow().get(&user) {
@@ -215,17 +233,16 @@ impl Server {
             user, appname
         );
 
-        Some(api.send(
-            requests::SendMessage::new(chatid, msg)
-                .reply_markup(inline_keyboard),
-        ).and_then(move |msg| {
-            println!("confirm message id = {}", msg.id);
-            // Save message id and channel writer for future use.
-            state.msgid_chan.borrow_mut().insert(msg.id, sock_writer);
-            Ok(())
-        }).map_err(move |e| {
-            println!("error sending message to {}: {:?}", user, e)
-        }))
+        Some(
+            api.send(requests::SendMessage::new(chatid, msg).reply_markup(inline_keyboard))
+                .and_then(move |msg| {
+                    println!("confirm message id = {}", msg.id);
+                    // Save message id and channel writer for future use.
+                    state.msgid_chan.borrow_mut().insert(msg.id, sock_writer);
+                    Ok(())
+                })
+                .map_err(move |e| println!("error sending message to {}: {:?}", user, e)),
+        )
     }
 }
 
