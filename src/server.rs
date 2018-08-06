@@ -10,7 +10,7 @@ use std::rc::Rc;
 use std::str;
 use telegram_bot::*;
 use tokio_core::net::{TcpListener, TcpStream};
-use tokio_core::reactor::Core;
+use tokio_core::reactor::{Core, Handle};
 use tokio_io::io::{self, ReadHalf};
 use tokio_io::AsyncRead;
 
@@ -86,8 +86,9 @@ impl Server {
     /// and Telegram updates. It panics if not bound or binding
     /// failed.
     pub fn run(mut self) -> ! {
-        let handle = &self.core.handle();
+        let handle = self.core.handle();
         let api = &self.api.unwrap();
+        let listener = self.listener.unwrap();
         let trusted_users = self.trusted_users;
         let trusted_apps = self.trusted_apps;
         let state = self.state;
@@ -96,95 +97,135 @@ impl Server {
         let (sock_tx, bot_rx) = mpsc::unbounded();
 
         // bot side: communicate with telegram api and socket
-        let bot_updates = api
-            .stream()
-            .for_each(|update| {
-                process_telegram_update(api, update, trusted_users.clone(), state.clone());
-                Ok(())
-            })
-            .map_err(|e| println!("bot updates error: {:?}", e));
+        let bot_updates = Server::bot_updates(api, trusted_users.clone(), state.clone());
+        let bot_controller = Server::bot_controller(api, handle.clone(), bot_rx, trusted_users, trusted_apps, state);
+        let bot = bot_updates.select(bot_controller).map(unit).map_err(unit);
 
-        let bot_server = bot_rx.for_each(|message: ServerMessage| {
+        // socket side:
+        let req = Server::local_requests(handle.clone(), listener, sock_tx);
+
+        // join the two sides and run on the default executor
+        self.core.run(req.join(bot)).map(unit).unwrap();
+        panic!("Unexpected exit from event loop")
+    }
+
+    /// This function constructs a future that deals with local
+    /// requests.
+    fn local_requests(
+        handle: Handle,
+        listener: TcpListener,
+        sock_tx: mpsc::UnboundedSender<ServerMessage>
+    ) -> impl Future<Item = (), Error = ()> {
+        let sock_tx = sock_tx.clone();
+
+        listener.incoming().for_each(move |(stream, addr)| {
+            println!("New connection: {}", addr);
+            let (reader, writer) = stream.split();
+            let (chan_tx, chan_rx) = mpsc::unbounded();
+
+            let socket_reader = process_verification_request(reader, chan_tx, sock_tx.clone());
+            let socket_writer = chan_rx
+                .fold(writer, |writer, msg: &str| {
+                    io::write_all(writer, msg.as_bytes())
+                        .map(|(writer, _)| writer)
+                        .map_err(|e| println!("in write all: {:?}", e))
+                })
+                .map(unit);
+
+            handle.spawn(socket_reader.select(socket_writer).map(unit).map_err(unit));
+            Ok(())
+        }).map_err(|e| println!("socket error: {:?}", e))
+    }
+
+    /// This function constructs a future that deals with Telegram bot
+    /// updates.
+    fn bot_updates<'a>(
+        api: &'a Api,
+        trusted_users: Rc<BTreeSet<String>>,
+        state: Rc<State>
+    ) -> impl Future<Item = (), Error = ()> + 'a {
+        api.stream().for_each(move |update| {
+            process_telegram_update(api, update, trusted_users.clone(), state.clone());
+            Ok(())
+        }).map_err(|e| println!("bot updates error: {:?}", e))
+    }
+
+
+    /// This function constructs a future that listens for server's
+    /// internal message, and do Telegram-bot-y things on behalf of
+    /// the message sender.
+    fn bot_controller<'a>(
+        api: &'a Api,
+        handle: Handle,
+        bot_rx: mpsc::UnboundedReceiver<ServerMessage>,
+        trusted_users: Rc<BTreeSet<String>>,
+        trusted_apps: Rc<BTreeSet<String>>,
+        state: Rc<State>
+    ) -> impl Future<Item = (), Error = ()> + 'a {
+        bot_rx.for_each(move |message| {
             match message {
-                ServerMessage::SendMessage(writer, appname) => {
-                    let user_chatid = state.user_chatid.borrow();
+                ServerMessage::SendMessage(sock_writer, appname) => {
                     let trusted_users = trusted_users.clone();
 
                     if !trusted_apps.contains(&appname) {
                         println!("{} is denied because it's not trusted", appname);
-                        writer.unbounded_send(VerifyResult::Deny.into()).unwrap();
+                        sock_writer.unbounded_send(VerifyResult::Deny.into()).unwrap();
                         return Ok(());
                     }
 
                     // Send confirm messages to every trusted user
                     for user in trusted_users.iter() {
-                        let user = user.clone();
-                        let state = state.clone();
-                        let writer = writer.clone();
-                        let chatid = user_chatid.get(&user);
-                        if chatid.is_none() {
-                            println!("don't know chat id of user {}, ignoring", user);
-                            continue;
+                        if let Some(fut) = Server::send_confirm(api, user.clone(), appname.clone(), state.clone(), sock_writer.clone())
+                        {
+                            handle.spawn(fut);
                         }
-                        let chatid = chatid.unwrap();
-
-                        let inline_keyboard = reply_markup!(
-                            inline_keyboard,
-                            ["Pass" callback "0,0", "Deny" callback "0,1"]
-                        );
-
-                        let mut msg = format!(
-                            "Hi, @{}! {} is asking for verification. Shall it pass?",
-                            user, appname
-                        );
-                        let fut =
-                            api.send(
-                                requests::SendMessage::new(chatid, msg)
-                                    .reply_markup(inline_keyboard),
-                            ).and_then(move |msg| {
-                                    println!("confirm message id = {}", msg.id);
-                                    // Save message id and channel writer for future use.
-                                    state.msgid_chan.borrow_mut().insert(msg.id, writer);
-                                    Ok(())
-                                })
-                                .map_err(move |e| {
-                                    println!("error sending message to {}: {:?}", user, e)
-                                });
-                        handle.spawn(fut);
                     }
                 }
             }
             Ok(())
-        });
-        let bot = bot_updates.select(bot_server).map(unit).map_err(unit);
+        })
+    }
 
-        // socket side:
-        // impl Stream<Item = (), Error = ()>
-        let req = self
-            .listener
-            .unwrap()
-            .incoming()
-            .for_each(|(stream, addr)| {
-                println!("New connection: {}", addr);
-                let (reader, writer) = stream.split();
-                let (chan_tx, chan_rx) = mpsc::unbounded();
+    /// This function constructs a future that sends a confirm message
+    /// to a specific user who has already initiated a conversation
+    /// with the bot.
+    fn send_confirm(
+        api: &Api,
+        user: String,
+        appname: String,
+        state: Rc<State>,
+        sock_writer: mpsc::UnboundedSender<&'static str>
+    ) -> Option<impl Future<Item = (), Error = ()> + 'static> {
+        let state = state.clone();
+        let chatid = match state.user_chatid.borrow().get(&user) {
+            Some(chatid) => chatid.clone(),
+            None => {
+                println!("don't know chat id of user {}, ignoring", user);
+                return None;
+            }
+        };
 
-                let socket_reader = process_verification_request(reader, chan_tx, sock_tx.clone());
-                let socket_writer = chan_rx
-                    .fold(writer, |writer, msg: &str| {
-                        io::write_all(writer, msg.as_bytes())
-                            .map(|(writer, _)| writer)
-                            .map_err(|e| println!("in write all: {:?}", e))
-                    })
-                    .map(unit);
+        let inline_keyboard = reply_markup!(
+            inline_keyboard,
+            ["Pass" callback "0,0", "Deny" callback "0,1"]
+        );
 
-                handle.spawn(socket_reader.select(socket_writer).map(unit).map_err(unit));
-                Ok(())
-            })
-            .map_err(|e| println!("socket error: {:?}", e));
+        let msg = format!(
+            "Hi, @{}! {} is asking for verification. Shall it pass?",
+            user, appname
+        );
 
-        self.core.run(req.join(bot)).map(unit).unwrap();
-        panic!("Unexpected exit from event loop")
+        Some(api.send(
+            requests::SendMessage::new(chatid, msg)
+                .reply_markup(inline_keyboard),
+        ).and_then(move |msg| {
+            println!("confirm message id = {}", msg.id);
+            // Save message id and channel writer for future use.
+            state.msgid_chan.borrow_mut().insert(msg.id, sock_writer);
+            Ok(())
+        }).map_err(move |e| {
+            println!("error sending message to {}: {:?}", user, e)
+        }))
     }
 }
 
