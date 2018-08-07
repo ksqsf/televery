@@ -1,5 +1,6 @@
 extern crate bytes;
 extern crate clap;
+extern crate env_logger;
 extern crate failure;
 extern crate serde_yaml;
 extern crate tokio_core;
@@ -7,6 +8,8 @@ extern crate tokio_io;
 
 #[macro_use]
 extern crate futures;
+#[macro_use]
+extern crate log;
 #[macro_use]
 extern crate serde_derive;
 #[macro_use]
@@ -22,6 +25,8 @@ use std::fs::File;
 use std::path::Path;
 
 fn main() -> Result<(), Error> {
+    env_logger::init();
+
     let matches = App::new("Televery")
         .about("Hassle-free two-step verification")
         .arg(
@@ -36,7 +41,7 @@ fn main() -> Result<(), Error> {
         .get_matches();
 
     if matches.occurrences_of("config") == 0 {
-        eprintln!("WARNING: --config not specified, 'config.yml' is used");
+        warn!("--config not specified, 'config.yml' is used");
     }
 
     Config::from_file(matches.value_of("config").unwrap()).and_then(|cfg| start_server(cfg))

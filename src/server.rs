@@ -128,7 +128,7 @@ impl Server {
         listener
             .incoming()
             .for_each(move |(stream, addr)| {
-                println!("New connection: {}", addr);
+                debug!("New connection: {}", addr);
                 let (reader, writer) = stream.split();
                 let (chan_tx, chan_rx) = mpsc::unbounded();
 
@@ -137,14 +137,14 @@ impl Server {
                     .fold(writer, |writer, msg: &str| {
                         io::write_all(writer, msg.as_bytes())
                             .map(|(writer, _)| writer)
-                            .map_err(|e| println!("in write all: {:?}", e))
+                            .map_err(|e| error!("in write all: {:?}", e))
                     })
                     .map(unit);
 
                 handle.spawn(socket_reader.select(socket_writer).map(unit).map_err(unit));
                 Ok(())
             })
-            .map_err(|e| println!("socket error: {:?}", e))
+            .map_err(|e| error!("socket error: {:?}", e))
     }
 
     /// This function constructs a future that deals with Telegram bot
@@ -159,7 +159,7 @@ impl Server {
                 process_telegram_update(api, update, trusted_users.clone(), state.clone());
                 Ok(())
             })
-            .map_err(|e| println!("bot updates error: {:?}", e))
+            .map_err(|e| error!("bot updates error: {:?}", e))
     }
 
     /// This function constructs a future that listens for server's
@@ -179,7 +179,7 @@ impl Server {
                     let trusted_users = trusted_users.clone();
 
                     if !trusted_apps.contains(&appname) {
-                        println!("{} is denied because it's not trusted", appname);
+                        debug!("{} is denied because it's not trusted", appname);
                         sock_writer
                             .unbounded_send(VerifyResult::Deny.into())
                             .unwrap();
@@ -218,7 +218,7 @@ impl Server {
         let chatid = match state.user_chatid.borrow().get(&user) {
             Some(chatid) => chatid.clone(),
             None => {
-                println!("don't know chat id of user {}, ignoring", user);
+                warn!("don't know chat id of user {}, ignoring", user);
                 return None;
             }
         };
@@ -236,12 +236,12 @@ impl Server {
         Some(
             api.send(requests::SendMessage::new(chatid, msg).reply_markup(inline_keyboard))
                 .and_then(move |msg| {
-                    println!("confirm message id = {}", msg.id);
+                    debug!("confirm message id = {}", msg.id);
                     // Save message id and channel writer for future use.
                     state.msgid_chan.borrow_mut().insert(msg.id, sock_writer);
                     Ok(())
                 })
-                .map_err(move |e| println!("error sending message to {}: {:?}", user, e)),
+                .map_err(move |e| error!("in sending message to {}: {:?}", user, e)),
         )
     }
 }
@@ -301,17 +301,17 @@ fn process_telegram_message(
 fn process_telegram_callback(api: &Api, query: CallbackQuery, state: Rc<State>) {
     let username = query.from.username.unwrap();
     let response = if query.data == "0,0" {
-        println!("{:?} passed id {}", username, query.message.id);
+        debug!("{:?} passed id {}", username, query.message.id);
         VerifyResult::Allow
     } else {
-        println!("{:?} denied id {}", username, query.message.id);
+        debug!("{:?} denied id {}", username, query.message.id);
         VerifyResult::Deny
     };
 
     let tx = match state.msgid_chan.borrow().get(&query.message.id) {
         Some(tx) => tx.clone(),
         None => {
-            println!("invalid message id");
+            error!("invalid message id {}", query.message.id);
             return;
         }
     };
@@ -334,7 +334,7 @@ fn process_verification_request(
 ) -> impl Future<Item = (), Error = ()> {
     Frames::new(stream)
         .for_each(move |request| {
-            println!("{} asks {}", request.appname, request.method);
+            debug!("{} asks {}", request.appname, request.method);
             match request.method.as_str() {
                 "REQ" => {
                     sock_tx
@@ -350,7 +350,7 @@ fn process_verification_request(
             }
             Ok(())
         })
-        .map_err(|e| println!("in process verify: {:?}", e))
+        .map_err(|e| error!("in process verify: {:?}", e))
 }
 
 /// A custom codec for turning stream of bytes into custom requests. I
