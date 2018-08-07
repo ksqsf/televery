@@ -8,7 +8,7 @@ accurately, server.
 3. Televery sends you a verification message, which comprises
    essential information and two inline buttons "Pass" and "Deny".
    Meanwhile, the client waits for reply from Televery.
-4. If you click "Pass", the client will be informed of the
+4. If you click "Pass", the client will be informed that the
    verification succeeded.
 5. If you click "Deny" or it's timed out, the client will be noticed
    that the verification failed.
