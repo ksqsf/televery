@@ -26,7 +26,6 @@ pub struct Server {
     listener: Option<TcpListener>,
 
     /// Trusted apps.
-    #[allow(dead_code)]
     trusted_apps: Rc<BTreeSet<String>>,
 
     /// Trusted Telegram usernames.
@@ -308,21 +307,21 @@ fn process_telegram_callback(api: &Api, query: CallbackQuery, state: Rc<State>) 
         VerifyResult::Deny
     };
 
-    let tx = match state.msgid_chan.borrow().get(&query.message.id) {
-        Some(tx) => tx.clone(),
+    match state.msgid_chan.borrow().get(&query.message.id).cloned() {
+        Some(tx) => {
+            tx.unbounded_send(response.into()).unwrap();
+            state.msgid_chan.borrow_mut().remove(&query.message.id);
+            api.spawn(query.message.edit_text(
+                format!(
+                    "@{} has answered this verification request.",
+                    username
+                )
+            ))
+        }
         None => {
             error!("invalid message id {}", query.message.id);
-            return;
         }
-    };
-
-    tx.unbounded_send(response.into()).unwrap();
-    state.msgid_chan.borrow_mut().remove(&query.message.id);
-
-    api.spawn(query.message.edit_text(format!(
-        "@{} has answered this verification request.",
-        username
-    )))
+    }
 }
 
 /// Process verification requests. This function will consume a stream
